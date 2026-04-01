@@ -100,7 +100,17 @@ class DetectionValidator(BaseValidator):
 
     def get_desc(self) -> str:
         """Return a formatted string summarizing class metrics of YOLO model."""
-        return ("%22s" + "%11s" * 6) % ("Class", "Images", "Instances", "Box(P", "R", "mAP50", "mAP50-95)")
+        return ("%22s" + "%11s" * 8) % (
+            "Class",
+            "Images",
+            "Instances",
+            "Box(P",
+            "R",
+            "mAP50",
+            "mAP50-95)",
+            "ImgP",
+            "ImgR",
+        )
 
     def postprocess(self, preds: torch.Tensor) -> list[dict[str, torch.Tensor]]:
         """Apply Non-maximum suppression to prediction outputs.
@@ -176,17 +186,21 @@ class DetectionValidator(BaseValidator):
             self.seen += 1
             pbatch = self._prepare_batch(si, batch)
             predn = self._prepare_pred(pred)
+            stat = self._process_batch(predn, pbatch)
 
             cls = pbatch["cls"].cpu().numpy()
             no_pred = predn["cls"].shape[0] == 0
             self.metrics.update_stats(
                 {
-                    **self._process_batch(predn, pbatch),
+                    **stat,
                     "target_cls": cls,
                     "target_img": np.unique(cls),
                     "conf": np.zeros(0) if no_pred else predn["conf"].cpu().numpy(),
                     "pred_cls": np.zeros(0) if no_pred else predn["cls"].cpu().numpy(),
                 }
+            )
+            self.metrics.update_image_stats(
+                {"image": pbatch["im_file"], **self.confusion_matrix.image_metrics(predn, pbatch, conf=self.args.conf)}
             )
             # Evaluate
             if self.args.plots:
@@ -228,15 +242,22 @@ class DetectionValidator(BaseValidator):
             for stats_dict in gathered_stats:
                 for key in merged_stats:
                     merged_stats[key].extend(stats_dict[key])
+            gathered_image_stats = [None] * dist.get_world_size()
+            dist.gather_object(self.metrics.image_stats, gathered_image_stats, dst=0)
+            merged_image_stats = []
+            for image_stats in gathered_image_stats:
+                merged_image_stats.extend(image_stats)
             gathered_jdict = [None] * dist.get_world_size()
             dist.gather_object(self.jdict, gathered_jdict, dst=0)
             self.jdict = []
             for jdict in gathered_jdict:
                 self.jdict.extend(jdict)
             self.metrics.stats = merged_stats
+            self.metrics.image_stats = merged_image_stats
             self.seen = len(self.dataloader.dataset)  # total image count from dataset
         elif RANK > 0:
             dist.gather_object(self.metrics.stats, None, dst=0)
+            dist.gather_object(self.metrics.image_stats, None, dst=0)
             dist.gather_object(self.jdict, None, dst=0)
             self.jdict = []
             self.metrics.clear_stats()
@@ -253,13 +274,14 @@ class DetectionValidator(BaseValidator):
 
     def print_results(self) -> None:
         """Print training/validation set metrics per class."""
-        pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
+        pf = "%22s" + "%11i" * 2 + "%11.3g" * 6
         LOGGER.info(pf % ("all", self.seen, self.metrics.nt_per_class.sum(), *self.metrics.mean_results()))
         if self.metrics.nt_per_class.sum() == 0:
             LOGGER.warning(f"no labels found in {self.args.task} set, cannot compute metrics without labels")
 
         # Print results per class
         if self.args.verbose and not self.training and self.nc > 1 and len(self.metrics.stats):
+            pf = "%22s" + "%11i" * 2 + "%11.3g" * 4
             for i, c in enumerate(self.metrics.ap_class_index):
                 LOGGER.info(
                     pf

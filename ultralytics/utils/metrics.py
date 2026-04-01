@@ -384,18 +384,15 @@ class ConfusionMatrix(DataExportMixin):
             conf (float, optional): Confidence threshold for detections.
             iou_thres (float, optional): IoU threshold for matching detections to ground truth.
         """
+        detections, gt_classes, detection_classes, matches = self._match_detections(detections, batch, conf, iou_thres)
         gt_cls, gt_bboxes = batch["cls"], batch["bboxes"]
         if self.matches is not None:  # only if visualization is enabled
             self.matches = {k: defaultdict(list) for k in {"TP", "FP", "FN", "GT"}}
             for i in range(gt_cls.shape[0]):
                 self._append_matches("GT", batch, i)  # store GT
-        is_obb = gt_bboxes.shape[1] == 5  # check if boxes contains angle for OBB
-        conf = 0.25 if conf in {None, 0.01 if is_obb else 0.001} else conf  # apply 0.25 if default val conf is passed
         no_pred = detections["cls"].shape[0] == 0
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if not no_pred:
-                detections = {k: detections[k][detections["conf"] > conf] for k in detections}
-                detection_classes = detections["cls"].int().tolist()
                 for i, dc in enumerate(detection_classes):
                     self.matrix[dc, self.nc] += 1  # FP
                     self._append_matches("FP", detections, i)
@@ -406,23 +403,6 @@ class ConfusionMatrix(DataExportMixin):
                 self.matrix[self.nc, gc] += 1  # FN
                 self._append_matches("FN", batch, i)
             return
-
-        detections = {k: detections[k][detections["conf"] > conf] for k in detections}
-        gt_classes = gt_cls.int().tolist()
-        detection_classes = detections["cls"].int().tolist()
-        bboxes = detections["bboxes"]
-        iou = batch_probiou(gt_bboxes, bboxes) if is_obb else box_iou(gt_bboxes, bboxes)
-
-        x = torch.where(iou > iou_thres)
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        else:
-            matches = np.zeros((0, 3))
 
         n = matches.shape[0] > 0
         m0, m1, _ = matches.transpose().astype(int)
@@ -444,6 +424,65 @@ class ConfusionMatrix(DataExportMixin):
             if not any(m1 == i):
                 self.matrix[dc, self.nc] += 1  # FP
                 self._append_matches("FP", detections, i)
+
+    @staticmethod
+    def _filter_detection_confidence(detections: dict[str, torch.Tensor], conf: float, is_obb: bool) -> tuple[dict, float]:
+        """Filter detections using the confusion-matrix confidence policy."""
+        conf = 0.25 if conf in {None, 0.01 if is_obb else 0.001} else conf
+        return {k: detections[k][detections["conf"] > conf] for k in detections}, conf
+
+    def _match_detections(
+        self, detections: dict[str, torch.Tensor], batch: dict[str, Any], conf: float = 0.25, iou_thres: float = 0.45
+    ) -> tuple[dict[str, torch.Tensor], list[int], list[int], np.ndarray]:
+        """Match detections to GT using the confusion-matrix confidence and IoU policy."""
+        gt_cls, gt_bboxes = batch["cls"], batch["bboxes"]
+        is_obb = gt_bboxes.shape[1] == 5
+        detections, _ = self._filter_detection_confidence(detections, conf, is_obb)
+        gt_classes = gt_cls.int().tolist()
+        detection_classes = detections["cls"].int().tolist()
+        if gt_cls.shape[0] == 0 or detections["cls"].shape[0] == 0:
+            return detections, gt_classes, detection_classes, np.zeros((0, 3))
+
+        bboxes = detections["bboxes"]
+        iou = batch_probiou(gt_bboxes, bboxes) if is_obb else box_iou(gt_bboxes, bboxes)
+        x = torch.where(iou > iou_thres)
+        if x[0].shape[0] == 0:
+            return detections, gt_classes, detection_classes, np.zeros((0, 3))
+
+        matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+        if x[0].shape[0] > 1:
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+            matches = matches[matches[:, 2].argsort()[::-1]]
+            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        return detections, gt_classes, detection_classes, matches
+
+    def image_metrics(
+        self, detections: dict[str, torch.Tensor], batch: dict[str, Any], conf: float = 0.25, iou_thres: float = 0.45
+    ) -> dict[str, float]:
+        """Return per-image TP, FP, FN, precision, and recall using confusion-matrix filtering and matching."""
+        detections, gt_classes, detection_classes, matches = self._match_detections(detections, batch, conf, iou_thres)
+        n = matches.shape[0] > 0
+        tp, fp, fn = 0, 0, 0
+        if gt_classes:
+            m0, m1, _ = matches.transpose().astype(int) if n else (np.array([], dtype=int),) * 3
+            for i, gc in enumerate(gt_classes):
+                j = m0 == i
+                if n and sum(j) == 1 and detection_classes[m1[j].item()] == gc:
+                    tp += 1
+                else:
+                    fn += 1
+            for i in range(len(detection_classes)):
+                if not any(m1 == i):
+                    fp += 1
+                elif detection_classes[i] != gt_classes[m0[m1 == i].item()]:
+                    fp += 1
+        else:
+            fp = len(detection_classes)
+
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        return {"tp": tp, "fp": fp, "fn": fn, "precision": precision, "recall": recall}
 
     def matrix(self):
         """Return the confusion matrix."""
@@ -1047,8 +1086,12 @@ class DetMetrics(SimpleClass, DataExportMixin):
         self.box = Metric()
         self.speed = {"preprocess": 0.0, "inference": 0.0, "loss": 0.0, "postprocess": 0.0}
         self.stats = dict(tp=[], conf=[], pred_cls=[], target_cls=[], target_img=[])
+        self.image_stats = []
+        self.image_results = []
         self.nt_per_class = None
         self.nt_per_image = None
+        self.mean_image_precision = 0.0
+        self.mean_image_recall = 0.0
 
     def update_stats(self, stat: dict[str, Any]) -> None:
         """Update statistics by appending new values to existing stat collections.
@@ -1059,6 +1102,10 @@ class DetMetrics(SimpleClass, DataExportMixin):
         """
         for k in self.stats.keys():
             self.stats[k].append(stat[k])
+
+    def update_image_stats(self, stat: dict[str, Any]) -> None:
+        """Store per-image detection counts and derived metrics."""
+        self.image_stats.append(stat)
 
     def process(self, save_dir: Path = Path("."), plot: bool = False, on_plot=None) -> dict[str, np.ndarray]:
         """Process predicted results for object detection and update metrics.
@@ -1089,21 +1136,36 @@ class DetMetrics(SimpleClass, DataExportMixin):
         self.box.update(results)
         self.nt_per_class = np.bincount(stats["target_cls"].astype(int), minlength=len(self.names))
         self.nt_per_image = np.bincount(stats["target_img"].astype(int), minlength=len(self.names))
+        self.image_results = list(self.image_stats)
+        if self.image_results:
+            self.mean_image_precision = float(np.mean([x["precision"] for x in self.image_results]))
+            self.mean_image_recall = float(np.mean([x["recall"] for x in self.image_results]))
+        else:
+            self.mean_image_precision = 0.0
+            self.mean_image_recall = 0.0
         return stats
 
     def clear_stats(self):
         """Clear the stored statistics."""
         for v in self.stats.values():
             v.clear()
+        self.image_stats.clear()
 
     @property
     def keys(self) -> list[str]:
         """Return a list of keys for accessing specific metrics."""
-        return ["metrics/precision(B)", "metrics/recall(B)", "metrics/mAP50(B)", "metrics/mAP50-95(B)"]
+        return [
+            "metrics/precision(B)",
+            "metrics/recall(B)",
+            "metrics/mAP50(B)",
+            "metrics/mAP50-95(B)",
+            "metrics/image_precision(B)",
+            "metrics/image_recall(B)",
+        ]
 
     def mean_results(self) -> list[float]:
-        """Calculate mean of detected objects & return precision, recall, mAP50, and mAP50-95."""
-        return self.box.mean_results()
+        """Calculate mean box metrics and mean per-image precision/recall."""
+        return [*self.box.mean_results(), self.mean_image_precision, self.mean_image_recall]
 
     def class_result(self, i: int) -> tuple[float, float, float, float]:
         """Return the result of evaluating the performance of an object detection model on a specific class."""
@@ -1174,6 +1236,22 @@ class DetMetrics(SimpleClass, DataExportMixin):
             }
             for i in range(len(per_class["Box-P"]))
         ]
+
+    def image_summary(self, decimals: int = 5) -> list[dict[str, Any]]:
+        """Generate a summarized representation of per-image detection counts and metrics."""
+        summary = []
+        for row in self.image_results:
+            summary.append(
+                {
+                    "Image": row["image"],
+                    "TP": row["tp"],
+                    "FP": row["fp"],
+                    "FN": row["fn"],
+                    "Precision": round(row["precision"], decimals),
+                    "Recall": round(row["recall"], decimals),
+                }
+            )
+        return summary
 
 
 class SegmentMetrics(DetMetrics):
