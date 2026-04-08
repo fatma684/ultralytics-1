@@ -77,6 +77,70 @@ def build_depth_anything(checkpoint: str = "depth_anything_v2_vits.pth") -> Dept
     if isinstance(state_dict, torch.nn.Module):
         state_dict = state_dict.state_dict()
 
+    # Remap checkpoint keys from official DA V2 naming to our module naming
+    state_dict = _remap_state_dict(state_dict)
+
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
+
+
+def _remap_state_dict(state_dict: dict) -> dict:
+    """Remap official Depth Anything V2 checkpoint keys to our module naming.
+
+    Official checkpoint uses `depth_head.scratch.*` naming; we use flat names.
+    """
+    mapped = {}
+    for k, v in state_dict.items():
+        new_k = k
+
+        # depth_head.scratch.layer{1-4}_rn → depth_head.layer_rn.{0-3}
+        m = re.match(r"depth_head\.scratch\.layer(\d+)_rn\.(.*)", k)
+        if m:
+            idx = int(m.group(1)) - 1  # 1-indexed → 0-indexed
+            new_k = f"depth_head.layer_rn.{idx}.{m.group(2)}"
+            mapped[new_k] = v
+            continue
+
+        # depth_head.scratch.refinenet{1-4}.resConfUnit{1,2} → depth_head.refinenets.{0-3}.res_conv{1,2}
+        m = re.match(r"depth_head\.scratch\.refinenet(\d+)\.resConfUnit(\d+)\.(.*)", k)
+        if m:
+            net_idx = int(m.group(1)) - 1
+            unit_idx = int(m.group(2))
+            new_k = f"depth_head.refinenets.{net_idx}.res_conv{unit_idx}.{m.group(3)}"
+            mapped[new_k] = v
+            continue
+
+        # depth_head.scratch.refinenet{1-4}.out_conv → depth_head.refinenets.{0-3}.output_conv
+        m = re.match(r"depth_head\.scratch\.refinenet(\d+)\.out_conv\.(.*)", k)
+        if m:
+            net_idx = int(m.group(1)) - 1
+            new_k = f"depth_head.refinenets.{net_idx}.output_conv.{m.group(2)}"
+            mapped[new_k] = v
+            continue
+
+        # depth_head.scratch.output_conv1 → depth_head.head_conv1
+        m = re.match(r"depth_head\.scratch\.output_conv1\.(.*)", k)
+        if m:
+            new_k = f"depth_head.head_conv1.{m.group(1)}"
+            mapped[new_k] = v
+            continue
+
+        # depth_head.scratch.output_conv2.0 → depth_head.head_conv2
+        m = re.match(r"depth_head\.scratch\.output_conv2\.0\.(.*)", k)
+        if m:
+            new_k = f"depth_head.head_conv2.{m.group(1)}"
+            mapped[new_k] = v
+            continue
+
+        # depth_head.scratch.output_conv2.2 → depth_head.head_conv3
+        m = re.match(r"depth_head\.scratch\.output_conv2\.2\.(.*)", k)
+        if m:
+            new_k = f"depth_head.head_conv3.{m.group(1)}"
+            mapped[new_k] = v
+            continue
+
+        # Everything else passes through unchanged (encoder keys, projects, resize_layers)
+        mapped[new_k] = v
+
+    return mapped
