@@ -127,7 +127,7 @@ For the full list of training parameters, see the [training configuration refere
 
 Two-stage fine-tuning splits training into two phases. The first stage freezes the backbone and trains only the neck and head, allowing the detection layers to adapt to the new classes without disrupting pretrained features. The second stage unfreezes all layers and trains the full model with a lower learning rate to refine the backbone for the target domain.
 
-This approach is particularly useful when the target domain differs significantly from COCO (medical images, aerial imagery, microscopy), where the backbone may need adaptation but training everything at once causes instability.
+This approach is particularly useful when the target domain differs significantly from COCO (medical images, aerial imagery, microscopy), where the backbone may need adaptation but training everything at once causes instability. For automatic unfreezing with a callback-based approach, see [Freezing and Unfreezing the Backbone](custom-trainer.md#freezing-and-unfreezing-the-backbone).
 
 !!! example "Two-stage fine-tuning"
 
