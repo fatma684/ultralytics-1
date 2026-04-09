@@ -64,7 +64,7 @@ Larger models have more capacity but also more parameters to update, which can i
 The default `optimizer=auto` setting selects the optimizer and learning rate based on the total number of training iterations:
 
 - **< 10,000 iterations** (small datasets or few epochs): AdamW with a low, auto-calculated learning rate
-- **> 10,000 iterations** (large datasets): MuSGD with lr=0.01
+- **> 10,000 iterations** (large datasets): [MuSGD](../reference/optim/muon.md) (a hybrid Muon+SGD optimizer) with lr=0.01
 
 For most fine-tuning tasks, the default setting works well without any manual tuning. Consider setting the optimizer explicitly when:
 
