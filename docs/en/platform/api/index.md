@@ -1479,7 +1479,6 @@ Cancels a Pro subscription at period end by default. Send `{"resume": true}` to 
 }
 ```
 
-
 ### Auto Top-Up
 
 Automatically add credits when balance falls below a threshold.
