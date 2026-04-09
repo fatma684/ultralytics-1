@@ -168,7 +168,7 @@ def export_formats():
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"]],
         ["Axelera AI", "axelera", "_axelera_model", False, False, ["batch", "int8", "fraction", "data"]],
-        ["Ethos", "ethos", "_ethos_model", False, False, ["data", "int8"]]
+        ["Ethos", "ethos", "_ethos_model", False, False, ["data", "int8"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -1034,7 +1034,7 @@ class Exporter:
         from ultralytics.utils.export.executorch import torch2executorch
 
         return torch2executorch(self.model, self.file, self.im, metadata=self.metadata, prefix=prefix)
-    
+
     @try_export
     def export_ethos(self, prefix=colorstr("Ethos:")):
         """Export YOLO model to ExecuTorch *.pte format."""

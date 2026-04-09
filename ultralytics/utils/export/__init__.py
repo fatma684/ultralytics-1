@@ -31,5 +31,5 @@ __all__ = [
     "torch2onnx",
     "torch2openvino",
     "torch2paddle",
-    "torch2torchscript"
+    "torch2torchscript",
 ]

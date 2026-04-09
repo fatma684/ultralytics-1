@@ -10,17 +10,14 @@ from ultralytics.utils import LOGGER, YAML
 
 
 def torch2ethos(
-    model: torch.nn.Module,
-    file: Path | str,
-    sample_input: torch.Tensor,
-    metadata: dict | None = None,
-    prefix: str = "") -> str:
-    
+    model: torch.nn.Module, file: Path | str, sample_input: torch.Tensor, metadata: dict | None = None, prefix: str = ""
+) -> str:
+
     from executorch import version as executorch_version
     from executorch.backends.arm.ethosu import EthosUCompileSpec
     from executorch.backends.arm.quantizer import EthosUQuantizer, get_symmetric_quantization_config
     from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
-    
+
     LOGGER.info(f"\n{prefix} starting export with ExecuTorch {executorch_version.__version__}...")
 
     file = Path(file)
@@ -29,13 +26,13 @@ def torch2ethos(
 
     exported_program = torch.export.export(model, (sample_input,))
     graph_module = exported_program.module(check_guards=False)
-    
+
     compile_spec = EthosUCompileSpec(
-            target="ethos-u55-128",
-            system_config="Ethos_U55_High_End_Embedded",
-            memory_mode="Shared_Sram",
-        )
-    
+        target="ethos-u55-128",
+        system_config="Ethos_U55_High_End_Embedded",
+        memory_mode="Shared_Sram",
+    )
+
     quantizer = EthosUQuantizer(compile_spec)
     operator_config = get_symmetric_quantization_config()
     quantizer.set_global(operator_config)
@@ -48,7 +45,7 @@ def torch2ethos(
     _ = quantized_graph_module.print_readable()
 
     quantized_exported_program = torch.export.export(quantized_graph_module, (sample_input,))
-    
+
     from executorch.backends.arm.ethosu import EthosUPartitioner
     from executorch.exir import (
         EdgeCompileConfig,
@@ -62,17 +59,17 @@ def torch2ethos(
 
     # Lower the exported program to the Ethos-U backend
     edge_program_manager = to_edge_transform_and_lower(
-                quantized_exported_program,
-                partitioner=[partitioner],
-                compile_config=EdgeCompileConfig(
-                    _check_ir_validity=False,
-                ),
-            )
+        quantized_exported_program,
+        partitioner=[partitioner],
+        compile_config=EdgeCompileConfig(
+            _check_ir_validity=False,
+        ),
+    )
 
     # Convert edge program to executorch
     executorch_program_manager = edge_program_manager.to_executorch(
-                config=ExecutorchBackendConfig(extract_delegate_segments=False)
-            )
+        config=ExecutorchBackendConfig(extract_delegate_segments=False)
+    )
 
     _ = executorch_program_manager.exported_program().module(check_guards=False).print_readable()
 
