@@ -34,10 +34,13 @@ def load(model, weights_path, remap=True):
         remapped = {}
         for k, v in csd.items():
             if k.startswith("model.9."):
+                # Remap cls model.9 (C2PSA) -> det model.10 (C2PSA). Drop original model.9
+                # keys to avoid corrupting det model.9 (SPPF) via intersect_dicts shape matching
                 remapped[k.replace("model.9.", "model.10.")] = v
-            remapped[k] = v
+            else:
+                remapped[k] = v
         csd = remapped
-        LOGGER.info("Remapped cls model.9 (C2PSA) -> det model.10 (C2PSA)")
+        LOGGER.info("Remapped cls model.9 (C2PSA) -> det model.10 (C2PSA), dropped original model.9 keys")
 
     updated = intersect_dicts(csd, model.model.state_dict())
     model.model.load_state_dict(updated, strict=False)
