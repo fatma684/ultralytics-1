@@ -58,6 +58,7 @@ dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
 end2end: # (bool, optional) whether to use end2end head(YOLO26, YOLOv10) for predict/val/export
 obb_iou: probiou # (str) OBB IoU calculation method: 'probiou' (faster, approximate) or 'polygon' (slower, exact)
+angle_define: le135 # (str) OBB angle definition: 'le135' ([-pi/4, 3pi/4)) or 'le90' ([-pi/2, pi/2), long edge to x-axis) or 'oc' ([0, pi/2)
 
 # Predict settings -----------------------------------------------------------------------------------------------------
 source: # (str, optional) path/dir/URL/stream for images or videos; e.g. 'ultralytics/assets' or '0' for webcam

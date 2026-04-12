@@ -336,7 +336,7 @@ def ltwh2xywh(x):
     return y
 
 
-def xyxyxyxy2xywhr(x):
+def xyxyxyxy2xywhr(x, angle_define="le135"):
     """Convert batched Oriented Bounding Boxes (OBB) from [xy1, xy2, xy3, xy4] to [xywh, rotation] format.
 
     Args:
@@ -354,15 +354,26 @@ def xyxyxyxy2xywhr(x):
         # NOTE: Use cv2.minAreaRect to get accurate xywhr,
         # especially some objects are cut off by augmentations in dataloader.
         (cx, cy), (w, h), angle = cv2.minAreaRect(pts)
-        # convert angle to radian and normalize to [-pi/4, 3pi/4)
-        theta = angle / 180 * np.pi
-        if w < h:
-            w, h = h, w
-            theta += np.pi / 2
-        while theta >= 3 * np.pi / 4:
-            theta -= np.pi
-        while theta < -np.pi / 4:
-            theta += np.pi
+        theta = angle / 180 * np.pi  # oc: [0, pi/2)
+        if angle_define == "le135":
+            # convert angle to [-pi/4, 3pi/4)
+            if w < h:
+                w, h = h, w
+                theta += np.pi / 2
+            while theta >= 3 * np.pi / 4:
+                theta -= np.pi
+            while theta < -np.pi / 4:
+                theta += np.pi
+        elif angle_define == "le90":
+            # convert angle to [-pi/2, pi/2), long edge as w
+            if w < h:
+                w, h = h, w
+                theta += np.pi / 2
+            while theta >= np.pi / 2:
+                theta -= np.pi
+            while theta < -np.pi / 2:
+                theta += np.pi
+        # oc: no change, keep raw cv2.minAreaRect output in [0, pi/2)
         rboxes.append([cx, cy, w, h, theta])
     return torch.tensor(rboxes, device=x.device, dtype=x.dtype) if is_torch else np.asarray(rboxes)
 

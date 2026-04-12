@@ -1109,7 +1109,11 @@ class v8OBBLoss(v8DetectionLoss):
         scale_weight = torch.exp(-(log_ar**2) / (lambda_val**2))
 
         delta_theta = pred_theta - target_theta
-        delta_theta_wrapped = delta_theta - torch.round(delta_theta / math.pi) * math.pi
+        if self.hyp.angle_define == "oc":
+            period = math.pi / 2
+        else:
+            period = math.pi
+        delta_theta_wrapped = delta_theta - torch.round(delta_theta / period) * period
         ang_loss = torch.sin(2 * delta_theta_wrapped[fg_mask]) ** 2
 
         ang_loss = scale_weight[fg_mask] * ang_loss
