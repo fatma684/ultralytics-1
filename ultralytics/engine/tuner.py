@@ -489,29 +489,29 @@ class Tuner:
             dataset_metrics = {}
             for j, (d, dataset) in enumerate(zip(data, dataset_names)):
                 metrics_i = {}
-                try:
-                    train_args["data"] = d
-                    train_args["save_dir"] = str(save_dir[j])  # pass save_dir to subprocess to ensure same path is used
-                    # Train YOLO model with mutated hyperparameters (run in subprocess to avoid dataloader hang)
-                    launch = [
-                        __import__("sys").executable,
-                        "-m",
-                        "ultralytics.cfg.__init__",
-                    ]  # workaround yolo not found
-                    cmd = [*launch, "train", *(f"{k}={v}" for k, v in train_args.items())]
-                    return_code = subprocess.run(cmd, check=True).returncode
-                    ckpt_file = weights_dir[j] / ("best.pt" if (weights_dir[j] / "best.pt").exists() else "last.pt")
-                    metrics_i = torch_load(ckpt_file)["train_metrics"]
-                    metrics = metrics_i
-                    assert return_code == 0, "training failed"
+                # try:
+                train_args["data"] = d
+                train_args["save_dir"] = str(save_dir[j])  # pass save_dir to subprocess to ensure same path is used
+                # Train YOLO model with mutated hyperparameters (run in subprocess to avoid dataloader hang)
+                launch = [
+                    __import__("sys").executable,
+                    "-m",
+                    "ultralytics.cfg.__init__",
+                ]  # workaround yolo not found
+                cmd = [*launch, "train", *(f"{k}={v}" for k, v in train_args.items())]
+                return_code = subprocess.run(cmd, check=True).returncode
+                ckpt_file = weights_dir[j] / ("best.pt" if (weights_dir[j] / "best.pt").exists() else "last.pt")
+                metrics_i = torch_load(ckpt_file)["train_metrics"]
+                metrics = metrics_i
+                assert return_code == 0, "training failed"
 
-                    # Cleanup
-                    time.sleep(1)
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                # Cleanup
+                time.sleep(1)
+                gc.collect()
+                torch.cuda.empty_cache()
 
-                except Exception as e:
-                    LOGGER.error(f"training failure for hyperparameter tuning iteration {i + 1}\n{e}")
+                # except Exception as e:
+                #     LOGGER.error(f"training failure for hyperparameter tuning iteration {i + 1}\n{e}")
 
                 # Save results - MongoDB takes precedence
                 dataset_metrics[dataset] = metrics_i or {"fitness": 0.0}
