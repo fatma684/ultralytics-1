@@ -73,7 +73,7 @@ The `dx_com` compiler package will be automatically installed from the DeepX SDK
 
         ```bash
         # Export a YOLO26n PyTorch model to DeepX format
-        yolo export model=yolo26n.pt format=deepx  # creates 'yolo26n_deepx_model/'
+        yolo export model=yolo26n.pt format=deepx # creates 'yolo26n_deepx_model/'
         ```
 
 ### Export Arguments
