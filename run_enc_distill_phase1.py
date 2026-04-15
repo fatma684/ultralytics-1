@@ -21,12 +21,20 @@ RECIPES = {
 }
 
 
-def _pop_resume(argv: list[str]) -> tuple[list[str], str]:
-    """Return argv without '--resume <path>' and the resume path."""
-    if "--resume" not in argv:
+def _pop_flag(argv: list[str], flag: str, is_bool: bool = False) -> tuple[list[str], str]:
+    """Pop a --flag [value] pair from argv, return (remaining_argv, value).
+
+    Args:
+        argv: argument list
+        flag: flag name (e.g. "--resume")
+        is_bool: if True, flag has no value argument
+    """
+    if flag not in argv:
         return argv, ""
-    index = argv.index("--resume")
-    return argv[:index] + argv[index + 2 :], argv[index + 1]
+    i = argv.index(flag)
+    if is_bool:
+        return argv[:i] + argv[i + 1 :], "true"
+    return argv[:i] + argv[i + 2 :], argv[i + 1]
 
 
 def _load_train_args(resume: str) -> dict:
@@ -39,21 +47,31 @@ def main(argv: list[str]) -> None:
 
     Args:
         argv: [gpu, teachers, name, recipe, model_yaml, data, epochs]
-        recipe: "default", "eupe", or "radio"
-        model_yaml: e.g. "yolo26s-cls.yaml" or "yolo26l-cls.yaml"
-        epochs: overrides recipe default if provided
+        --resume <path>: resume from checkpoint
+        --cos_weight <float>: cosine loss weight (default 0.9)
+        --l1_weight <float>: smooth L1 loss weight (default 0.1)
+        --cls_l1: add smooth L1 to CLS token loss (default False)
     """
-    argv, resume = _pop_resume(argv[1:])
+    args = argv[1:]
+    args, resume = _pop_flag(args, "--resume")
+    args, cos_w = _pop_flag(args, "--cos_weight")
+    args, l1_w = _pop_flag(args, "--l1_weight")
+    args, cls_l1_str = _pop_flag(args, "--cls_l1", is_bool=True)
+
+    cos_weight = float(cos_w) if cos_w else 0.9
+    l1_weight = float(l1_w) if l1_w else 0.1
+    cls_l1 = bool(cls_l1_str)
+
     resume_args = _load_train_args(resume) if resume else {}
-    gpu = argv[0] if argv else "0"
-    teachers = argv[1] if len(argv) > 1 else resume_args.get("teachers", "eupe:vitb16")
+    gpu = args[0] if args else "0"
+    teachers = args[1] if len(args) > 1 else resume_args.get("teachers", "eupe:vitb16")
     name = (
-        argv[2] if len(argv) > 2 else resume_args.get("name", f"phase1-{teachers.replace(':', '-').replace('+', '_')}")
+        args[2] if len(args) > 2 else resume_args.get("name", f"phase1-{teachers.replace(':', '-').replace('+', '_')}")
     )
-    recipe = argv[3] if len(argv) > 3 else "default"
-    model_yaml = argv[4] if len(argv) > 4 else "yolo26s-cls.yaml"
-    data = argv[5] if len(argv) > 5 else "/data/shared-datasets/datacomp-12m"
-    epochs = int(argv[6]) if len(argv) > 6 else None
+    recipe = args[3] if len(args) > 3 else "default"
+    model_yaml = args[4] if len(args) > 4 else "yolo26s-cls.yaml"
+    data = args[5] if len(args) > 5 else "/data/shared-datasets/datacomp-12m"
+    epochs = int(args[6]) if len(args) > 6 else None
     r = RECIPES[recipe]
 
     model = YOLO(model_yaml)
@@ -67,8 +85,9 @@ def main(argv: list[str]) -> None:
             model=model_yaml,
             teachers=teachers,
             recipe=recipe,
-            cos_weight=0.9,
-            l1_weight=0.1,
+            cos_weight=cos_weight,
+            l1_weight=l1_weight,
+            cls_l1=cls_l1,
             grad_clip=r["grad_clip"],
             beta2=r["beta2"],
             wandb_group="distill",
@@ -79,6 +98,9 @@ def main(argv: list[str]) -> None:
         teachers=teachers,
         data=data,
         knn_eval="/data/shared-datasets/imagenet",
+        cos_weight=cos_weight,
+        l1_weight=l1_weight,
+        cls_l1=cls_l1,
         device=gpu,
         project=resume_args.get("project", "yolo-next-encoder"),
         name=name,
