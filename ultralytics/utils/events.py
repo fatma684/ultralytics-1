@@ -63,7 +63,6 @@ class Events:
             "env": ENVIRONMENT,
             "session_id": round(random.random() * 1e15),
             "engagement_time_msec": 1000,
-            "debug_mode": True,
         }
         self.enabled = (
             SETTINGS["sync"]

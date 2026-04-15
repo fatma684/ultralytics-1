@@ -83,10 +83,6 @@ def on_val_start(validator):
         events(validator.args, validator.device)
 
 
-def on_predict_start(predictor):
-    """Run events on predict start."""
-    pass  # Event is deferred to on_predict_batch_end where speed data is available
-
 
 def on_predict_batch_end(predictor):
     """Queue/update a predict event with the latest batch metadata.
@@ -111,7 +107,11 @@ def on_predict_batch_end(predictor):
     speed = None
     results = getattr(predictor, "results", None)
     if results:
-        speed = getattr(results[0], "speed", None)
+        try:
+            first = results[0]
+        except (TypeError, KeyError, IndexError):
+            first = next(iter(results), None)
+        speed = getattr(first, "speed", None) if first is not None else None
 
     # Use the backend's actual inference device (e.g. "npu", "metis", "cpu", "cuda:0") rather than
     # predictor.device, which may reflect the torch data-movement device instead of the real hardware.
@@ -119,7 +119,7 @@ def on_predict_batch_end(predictor):
     events(predictor.args, infer_device, backend=backend, imgsz=imgsz, model_params=model_params, speed=speed)
 
 
-def on_predict_end(predictor):
+def on_predict_end(_predictor):
     """Flush any pending predict event so it is delivered even if the rate limit never elapsed."""
     events.flush()
 
@@ -138,7 +138,6 @@ callbacks = (
         "on_train_end": on_train_end,
         "on_train_start": on_train_start,
         "on_val_start": on_val_start,
-        "on_predict_start": on_predict_start,
         "on_predict_batch_end": on_predict_batch_end,
         "on_predict_end": on_predict_end,
         "on_export_start": on_export_start,
