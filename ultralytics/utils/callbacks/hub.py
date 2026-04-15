@@ -85,11 +85,17 @@ def on_val_start(validator):
 
 def on_predict_start(predictor):
     """Run events on predict start."""
-    pass  # Event is deferred to on_predict_end where speed data is available
+    pass  # Event is deferred to on_predict_batch_end where speed data is available
 
 
 def on_predict_batch_end(predictor):
-    """Run events on predict batch end, collecting imgsz, model params, and inference speed."""
+    """Queue/update a predict event with the latest batch metadata.
+
+    Events.__call__ upserts by mode name, so repeated calls from a long-running stream overwrite
+    the queued entry rather than appending, keeping memory bounded. The rate limiter inside
+    Events.__call__ ensures at most one POST per rate_limit seconds during the run, and
+    on_predict_end flushes any remaining pending event after the final batch.
+    """
     model = getattr(predictor, "model", None)
     backend = getattr(model, "backend", None)
 
@@ -108,11 +114,14 @@ def on_predict_batch_end(predictor):
     if results:
         speed = getattr(results[0], "speed", None)
 
-    events(predictor.args, predictor.device, backend=backend, imgsz=imgsz, model_params=model_params, speed=speed)
+    # Use the backend's actual inference device (e.g. "npu", "metis", "cpu", "cuda:0") rather than
+    # predictor.device, which may reflect the torch data-movement device instead of the real hardware.
+    infer_device = getattr(backend, "infer_device", None) or str(predictor.device)
+    events(predictor.args, infer_device, backend=backend, imgsz=imgsz, model_params=model_params, speed=speed)
 
 
 def on_predict_end(predictor):
-    """Flush the events queue after prediction so daemon thread completes before process exits."""
+    """Flush any pending predict event so it is delivered even if the rate limit never elapsed."""
     events.flush()
 
 
