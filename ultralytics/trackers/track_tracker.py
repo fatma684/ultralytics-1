@@ -591,13 +591,14 @@ class TRACKTRACK:
 
                 self.encoder = ReID(model)
 
-    def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None) -> np.ndarray:
+    def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None, dets_del=None) -> np.ndarray:
         """Update tracker with new detections.
 
         Args:
             results: Detection results with conf, xywh/xywhr, and cls attributes.
             img (np.ndarray | None): Current frame image (for ReID).
             feats (np.ndarray | None): Pre-extracted features from backbone.
+            dets_del (tuple | None): Deleted detections (xywh, conf, cls) from loose NMS.
 
         Returns:
             (np.ndarray): Array of tracked objects [x1, y1, x2, y2, id, score, cls, idx].
@@ -626,11 +627,23 @@ class TRACKTRACK:
 
         # Initialize detection objects
         if self.with_reid and self.encoder is not None and img is not None:
-            features = self.encoder(feats if feats is not None else img, bboxes_keep)
+            features = self.encoder(img, bboxes_keep)  # ReID encoder crops from full image
             dets_high = [TTSTrack(b, s, c, f) for b, s, c, f in zip(bboxes_keep, scores_keep, cls_keep, features)]
         else:
             dets_high = [TTSTrack(b, s, c) for b, s, c in zip(bboxes_keep, scores_keep, cls_keep)]
         dets_low = [TTSTrack(b, s, c) for b, s, c in zip(bboxes_second, scores_second, cls_second)]
+
+        # D_del: deleted high-confidence detections recovered from loose NMS (paper Eq. 1)
+        dets_del_high = []
+        if dets_del is not None:
+            del_xywh, del_conf, del_cls = dets_del
+            # Add dummy index column to match bboxes format
+            del_bboxes = np.concatenate([del_xywh, -np.ones((len(del_xywh), 1))], axis=-1)
+            # Only keep high-confidence deleted detections
+            del_high_mask = del_conf > self.det_thr
+            if del_high_mask.any():
+                dets_del_high = [TTSTrack(b, s, c) for b, s, c in
+                                 zip(del_bboxes[del_high_mask], del_conf[del_high_mask], del_cls[del_high_mask])]
 
         # Split existing tracks
         tracked_stracks = []
@@ -653,8 +666,10 @@ class TRACKTRACK:
         # Predict
         self.multi_predict(strack_pool)
 
-        # === Main association: tracked+lost vs high+low detections ===
-        all_dets = dets_high + dets_low
+        # === Main association: tracked+lost vs high+low+del detections (paper Eq. 1) ===
+        all_dets = dets_high + dets_low + dets_del_high
+        n_high = len(dets_high)
+        n_low = len(dets_low)
 
         # Compute multi-cue cost matrix
         iou_sim, hmiou_dist = _hmiou_distance(strack_pool, all_dets)
@@ -671,10 +686,11 @@ class TRACKTRACK:
         cost += self.conf_weight * _confidence_distance(strack_pool, all_dets)
         cost += self.angle_weight * _angle_distance(strack_pool, all_dets, self.frame_id)
 
-        # Penalize low-confidence detections
-        n_high = len(dets_high)
+        # Penalize low-confidence and deleted detections (paper Eq. 1)
         if cost.shape[1] > n_high:
-            cost[:, n_high:] += self.penalty_p
+            cost[:, n_high:n_high + n_low] += self.penalty_p  # τ_p for D_low
+        if dets_del_high and cost.shape[1] > n_high + n_low:
+            cost[:, n_high + n_low:] += self.penalty_q  # τ_q for D_del
 
         # Constrain: if IoU is too low, set cost to 1
         if iou_sim.size > 0:
@@ -704,8 +720,18 @@ class TRACKTRACK:
         # === Association: unconfirmed tracks vs remaining high-confidence detections ===
         remaining_high_dets = [all_dets[i] for i in u_det if i < n_high]
         if unconfirmed and remaining_high_dets:
-            _, uc_dist = _hmiou_distance(unconfirmed, remaining_high_dets)
-            uc_matches, uc_u_track, uc_u_det = _iterative_associate(uc_dist, self.match_thr, self.reduce_step)
+            uc_iou_sim, uc_hmiou_dist = _hmiou_distance(unconfirmed, remaining_high_dets)
+            uc_cost = self.iou_weight * uc_hmiou_dist
+            if self.with_reid and self.encoder is not None:
+                uc_cost += self.reid_weight * self._cosine_distance(unconfirmed, remaining_high_dets)
+            else:
+                uc_cost += self.reid_weight * uc_hmiou_dist
+            uc_cost += self.conf_weight * _confidence_distance(unconfirmed, remaining_high_dets)
+            uc_cost += self.angle_weight * _angle_distance(unconfirmed, remaining_high_dets, self.frame_id)
+            if uc_iou_sim.size > 0:
+                uc_cost[uc_iou_sim <= 0.10] = 1.0
+            uc_cost = np.clip(uc_cost, 0, 1)
+            uc_matches, uc_u_track, uc_u_det = _iterative_associate(uc_cost, self.match_thr, self.reduce_step)
             for t_idx, d_idx in uc_matches:
                 unconfirmed[t_idx].update(remaining_high_dets[d_idx], self.frame_id)
                 activated_stracks.append(unconfirmed[t_idx])
@@ -765,22 +791,16 @@ class TRACKTRACK:
         if len(tracks) == 0 or len(dets) == 0:
             return np.ones((len(tracks), len(dets)), dtype=np.float64)
 
-        t_feat = []
-        for t in tracks:
-            if t.smooth_feat is not None:
-                t_feat.append(t.smooth_feat)
-            else:
-                t_feat.append(np.zeros(128, dtype=np.float32))  # fallback
+        # Determine feature dimension from first available feature
+        dim = 128
+        for obj in (*tracks, *dets):
+            f = obj.smooth_feat if obj.smooth_feat is not None else obj.curr_feat
+            if f is not None:
+                dim = f.shape[0]
+                break
 
-        d_feat = []
-        for d in dets:
-            if d.curr_feat is not None:
-                d_feat.append(d.curr_feat)
-            else:
-                d_feat.append(np.zeros(128, dtype=np.float32))  # fallback
-
-        t_feat = np.stack(t_feat, axis=0)
-        d_feat = np.stack(d_feat, axis=0)
+        t_feat = np.stack([t.smooth_feat if t.smooth_feat is not None else np.zeros(dim, dtype=np.float32) for t in tracks])
+        d_feat = np.stack([d.curr_feat if d.curr_feat is not None else np.zeros(dim, dtype=np.float32) for d in dets])
         return np.clip(1 - np.dot(t_feat, d_feat.T), 0, 1)
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:

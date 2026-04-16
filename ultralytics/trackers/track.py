@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 
 import torch
@@ -70,6 +70,19 @@ def on_predict_start(predictor: object, persist: bool = False) -> None:
     predictor.trackers = trackers
     predictor.vid_path = [None] * predictor.dataset.bs  # for determining when to reset tracker on new video
 
+    # For TrackTrack: wrap postprocess to capture raw preds for D_del computation
+    if cfg.tracker_type == "tracktrack" and not hasattr(predictor, "_orig_postprocess"):
+        orig_postprocess = predictor.postprocess
+
+        @wraps(orig_postprocess)
+        def _postprocess_with_raw_preds(preds, img, *args, **kwargs):
+            predictor._raw_preds = preds.clone() if isinstance(preds, torch.Tensor) else preds
+            predictor._preproc_img_shape = img.shape[2:]  # (H, W) of preprocessed image
+            return orig_postprocess(preds, img, *args, **kwargs)
+
+        predictor._orig_postprocess = orig_postprocess
+        predictor.postprocess = _postprocess_with_raw_preds
+
 
 def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None:
     """Postprocess detected boxes and update with object tracking.
@@ -85,6 +98,60 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
     """
     is_obb = predictor.args.task == "obb"
     is_stream = predictor.dataset.mode == "stream"
+
+    # Compute D_del for TrackTrack if raw preds are available
+    dets_del_list = None
+    raw_preds = getattr(predictor, "_raw_preds", None)
+    if raw_preds is not None and isinstance(predictor.trackers[0], TRACKTRACK):
+        from ultralytics.utils import nms, ops
+        import numpy as np
+
+        # Run looser NMS (IoU 0.95) on raw predictions
+        preds_loose = nms.non_max_suppression(
+            raw_preds,
+            predictor.args.conf,
+            0.95,  # loose IoU threshold
+            predictor.args.classes,
+            predictor.args.agnostic_nms,
+            max_det=predictor.args.max_det,
+            nc=0 if predictor.args.task == "detect" else len(predictor.model.names),
+            end2end=getattr(predictor.model, "end2end", False),
+            rotated=predictor.args.task == "obb",
+        )
+        dets_del_list = []
+        im_shape = getattr(predictor, "_preproc_img_shape", None)
+        for i_batch, (loose, result) in enumerate(zip(preds_loose, predictor.results)):
+            det_boxes = (result.obb if is_obb else result.boxes).cpu()
+            if len(loose) == 0 or len(det_boxes) == 0:
+                dets_del_list.append(None)
+                continue
+            # Scale loose NMS boxes from preprocessed coords to original image coords
+            loose_scaled = loose.clone()
+            if im_shape is not None:
+                loose_scaled[:, :4] = ops.scale_boxes(im_shape, loose_scaled[:, :4], result.orig_shape)
+            # Find D_del: loose NMS results that don't match any tight NMS result (IoU < 0.97)
+            from torchvision.ops import box_iou
+
+            tight_xyxy = det_boxes.xyxy.cpu()
+            loose_xyxy = loose_scaled[:, :4].cpu()
+            if tight_xyxy.numel() > 0 and loose_xyxy.numel() > 0:
+                ious = box_iou(loose_xyxy, tight_xyxy)
+                max_iou, _ = ious.max(dim=1)
+                del_mask = max_iou < 0.97
+                if del_mask.any():
+                    # Build D_del as numpy array with same format as det (xywh, conf, cls)
+                    del_boxes = loose_scaled[del_mask]
+                    # Convert xyxy -> xywh
+                    del_xywh = ops.xyxy2xywh(del_boxes[:, :4])
+                    del_conf = del_boxes[:, 4]
+                    del_cls = del_boxes[:, 5]
+                    dets_del_list.append((del_xywh.numpy(), del_conf.numpy(), del_cls.numpy()))
+                else:
+                    dets_del_list.append(None)
+            else:
+                dets_del_list.append(None)
+        predictor._raw_preds = None  # clear
+
     for i, result in enumerate(predictor.results):
         tracker = predictor.trackers[i if is_stream else 0]
         vid_path = predictor.save_dir / Path(result.path).name
@@ -93,7 +160,8 @@ def on_predict_postprocess_end(predictor: object, persist: bool = False) -> None
             predictor.vid_path[i if is_stream else 0] = vid_path
 
         det = (result.obb if is_obb else result.boxes).cpu().numpy()
-        tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None))
+        dets_del = dets_del_list[i] if dets_del_list is not None else None
+        tracks = tracker.update(det, result.orig_img, getattr(result, "feats", None), dets_del=dets_del)
         if len(tracks) == 0:
             continue
         idx = tracks[:, -1].astype(int)
