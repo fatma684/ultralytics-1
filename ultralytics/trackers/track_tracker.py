@@ -1,20 +1,19 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-"""TrackTrack: Multi-cue tracker with HMIoU, iterative assignment, and track-aware initialization.
+"""TrackTrack: Track-focused online multi-object tracker.
 
-Based on "Focusing on Tracks for Online Multi-Object Tracking" (CVPR 2025).
-Key features:
-    - HMIoU (Height-aware Modified IoU) for better vertical overlap handling
-    - Multi-cue cost: IoU + cosine ReID + confidence similarity + corner angle distance
-    - Iterative assignment with progressively decreasing threshold
-    - Track-Aware Initialization (TAI) NMS to suppress duplicate new tracks
-    - Corner-based velocity model for angle distance computation
-    - Confidence-aware Kalman filter with noise scaled by (1 - confidence)
+Reference: Shim et al., "Focusing on Tracks for Online Multi-Object Tracking" (CVPR 2025).
+
+The tracker introduces two main components on top of the standard tracking-by-detection pipeline:
+    - Track-Perspective-Based Association (TPA): multi-cue cost combining HMIoU, cosine ReID,
+      confidence similarity, and corner angle distance, solved with an iterative assignment that
+      progressively reduces the matching threshold.
+    - Track-Aware Initialization (TAI): selectively creates new tracks by suppressing candidates
+      that heavily overlap with existing active tracks or higher-scoring detections.
 """
 
 from __future__ import annotations
 
-from collections import deque
 from typing import Any
 
 import numpy as np
@@ -27,11 +26,11 @@ from .utils.kalman_filter import KalmanFilterXYWH
 
 
 def _bbox_overlaps(a_xyxy: np.ndarray, b_xyxy: np.ndarray) -> np.ndarray:
-    """Compute IoU matrix between two sets of boxes in xyxy format.
+    """Compute the IoU matrix between two sets of axis-aligned boxes.
 
     Args:
-        a_xyxy (np.ndarray): Array of shape (N, 4) in [x1, y1, x2, y2] format.
-        b_xyxy (np.ndarray): Array of shape (M, 4) in [x1, y1, x2, y2] format.
+        a_xyxy (np.ndarray): Array of shape (N, 4) in (x1, y1, x2, y2) format.
+        b_xyxy (np.ndarray): Array of shape (M, 4) in (x1, y1, x2, y2) format.
 
     Returns:
         (np.ndarray): IoU matrix of shape (N, M).
@@ -52,18 +51,19 @@ def _bbox_overlaps(a_xyxy: np.ndarray, b_xyxy: np.ndarray) -> np.ndarray:
 
 
 def _hmiou_distance(a_tracks: list, b_tracks: list) -> tuple[np.ndarray, np.ndarray]:
-    """Compute HMIoU (Height-aware Modified IoU) distance between tracks.
+    """Compute HMIoU (Height-aware Modified IoU) similarity and distance.
 
-    HMIoU = HIoU * IoU, where HIoU is the ratio of vertical overlap to total vertical extent.
-    Returns both the IoU similarity and HMIoU distance.
+    HMIoU = HIoU * IoU, where HIoU is the ratio of vertical overlap to total vertical extent. The
+    height modifier improves matching when detections with similar aspect ratios are stacked
+    vertically (common for pedestrians).
 
     Args:
-        a_tracks (list): List of track objects with xyxy property.
-        b_tracks (list): List of track objects with xyxy property.
+        a_tracks (list): Objects with an `xyxy` property (e.g. tracks).
+        b_tracks (list): Objects with an `xyxy` property (e.g. detections).
 
     Returns:
-        iou_sim (np.ndarray): IoU similarity matrix of shape (N, M).
-        hmiou_dist (np.ndarray): HMIoU distance matrix of shape (N, M).
+        iou_sim (np.ndarray): Raw IoU similarity matrix of shape (N, M).
+        hmiou_dist (np.ndarray): HMIoU distance matrix of shape (N, M), equal to 1 - HMIoU.
     """
     if len(a_tracks) == 0 or len(b_tracks) == 0:
         n, m = len(a_tracks), len(b_tracks)
@@ -72,35 +72,31 @@ def _hmiou_distance(a_tracks: list, b_tracks: list) -> tuple[np.ndarray, np.ndar
     a_boxes = np.ascontiguousarray([t.xyxy for t in a_tracks], dtype=np.float64)
     b_boxes = np.ascontiguousarray([t.xyxy for t in b_tracks], dtype=np.float64)
 
-    # Standard IoU
     iou_sim = _bbox_overlaps(a_boxes, b_boxes)
 
-    # Height IoU (HIoU): vertical overlap / vertical union
+    # Height IoU: vertical overlap divided by vertical union
     h_overlap = np.minimum(a_boxes[:, 3:4], b_boxes[:, 3:4].T) - np.maximum(a_boxes[:, 1:2], b_boxes[:, 1:2].T)
     h_union = np.maximum(a_boxes[:, 3:4], b_boxes[:, 3:4].T) - np.minimum(a_boxes[:, 1:2], b_boxes[:, 1:2].T)
     h_iou = np.clip(h_overlap / (h_union + 1e-9), 0, 1)
 
-    # HMIoU = HIoU * IoU
     hmiou_sim = h_iou * iou_sim
-    hmiou_dist = 1.0 - hmiou_sim
-
-    return iou_sim, hmiou_dist
+    return iou_sim, 1.0 - hmiou_sim
 
 
 def _corner_velocity(box_prev: np.ndarray, box_curr: np.ndarray) -> np.ndarray:
-    """Compute normalized velocity vectors for 4 corners (LT, LB, RT, RB).
+    """Compute normalized corner velocity vectors between two boxes.
 
-    Both boxes are in xyxy format [x1, y1, x2, y2].
+    The box is decomposed into its four corners (LT, LB, RT, RB). Each corner's displacement
+    between `box_prev` and `box_curr` is normalized to a unit direction vector.
 
     Args:
-        box_prev (np.ndarray): Previous box in xyxy format.
-        box_curr (np.ndarray): Current box in xyxy format.
+        box_prev (np.ndarray): Previous box in (x1, y1, x2, y2) format.
+        box_curr (np.ndarray): Current box in (x1, y1, x2, y2) format.
 
     Returns:
-        (np.ndarray): Corner velocities of shape (4, 2).
+        (np.ndarray): Corner velocity matrix of shape (4, 2) with unit-normalized (dx, dy) rows.
     """
     deltas = box_curr - box_prev
-    # Corner pairs: LT=(x1,y1), LB=(x1,y2), RT=(x2,y1), RB=(x2,y2)
     corners = [
         (deltas[0], deltas[1]),  # LT
         (deltas[0], deltas[3]),  # LB
@@ -115,32 +111,32 @@ def _corner_velocity(box_prev: np.ndarray, box_curr: np.ndarray) -> np.ndarray:
 
 
 def _angle_distance(tracks: list, dets: list, frame_id: int, delta_t: int = 3) -> np.ndarray:
-    """Compute angle-based distance between track velocities and track-to-detection directions.
+    """Compute the angle distance between track velocities and track-to-detection directions.
 
-    Vectorized: computes the full (N, M, 4, 2) velocity tensor in one pass.
+    For each (track, detection) pair the per-corner direction is computed from the track's box at
+    frame_id - delta_t to the detection, and compared via cosine angle to the track's stored corner
+    velocity. The resulting distance is averaged over the 4 corners and weighted by detection score.
 
     Args:
-        tracks (list[TTSTrack]): Tracked objects with velocity and history.
-        dets (list[TTSTrack]): Detection objects.
+        tracks (list[TTSTrack]): Tracks with `velocity` and box history.
+        dets (list[TTSTrack]): Detection candidates.
         frame_id (int): Current frame ID.
-        delta_t (int): Time delta for velocity computation.
+        delta_t (int): Number of frames back used to look up the reference track box.
 
     Returns:
-        (np.ndarray): Angle distance matrix of shape (N, M), values in [0, 1].
+        (np.ndarray): Angle distance matrix of shape (N, M), each value in [0, 1].
     """
     n_tracks, n_dets = len(tracks), len(dets)
     if n_tracks == 0 or n_dets == 0:
         return np.ones((n_tracks, n_dets), dtype=np.float64)
 
-    # Stack boxes once
     track_boxes_prev = np.stack([t.get_history_box(frame_id, delta_t) for t in tracks], axis=0)  # (N, 4)
     det_boxes = np.stack([d.xyxy for d in dets], axis=0)  # (M, 4)
 
-    # Delta per (track, det) pair: (N, M, 4)
+    # Per-pair box delta: (N, M, 4)
     deltas = det_boxes[None, :, :] - track_boxes_prev[:, None, :]
 
-    # Corner deltas: LT=(dx1,dy1), LB=(dx1,dy2), RT=(dx2,dy1), RB=(dx2,dy2)
-    # Shape: (N, M, 4, 2) where last dim is (dx, dy)
+    # Gather corner components so the last axis iterates LT, LB, RT, RB
     dx_idx = np.array([0, 0, 2, 2])
     dy_idx = np.array([1, 3, 1, 3])
     vel_dx = deltas[:, :, dx_idx]  # (N, M, 4)
@@ -149,25 +145,28 @@ def _angle_distance(tracks: list, dets: list, frame_id: int, delta_t: int = 3) -
     vel_dx /= norms
     vel_dy /= norms
 
-    # Stack track velocities: (N, 4, 2)
-    track_velocities = np.stack([t.velocity for t in tracks], axis=0)
+    track_velocities = np.stack([t.velocity for t in tracks], axis=0)  # (N, 4, 2)
 
-    # Dot product per corner: (N, M, 4)
+    # Per-corner dot product then average over corners
     dot = track_velocities[:, None, :, 0] * vel_dx + track_velocities[:, None, :, 1] * vel_dy
     angle_dist = np.abs(np.arccos(np.clip(dot, -1, 1))).mean(axis=-1) / np.pi  # (N, M)
 
-    # Fuse with detection scores
+    # Fuse with detection scores so low-confidence detections contribute less
     scores = np.array([d.score for d in dets])[None, :]
     angle_dist *= scores
     return angle_dist
 
 
 def _confidence_distance(tracks: list, dets: list) -> np.ndarray:
-    """Compute confidence-based distance using linear projection of track scores.
+    """Compute the confidence-based distance via linear projection of each track's score.
+
+    Each track's projected score is `score + (score - prev_score)`, assuming a first-order trend.
+    The distance is the absolute difference between the projected track score and each
+    detection's confidence.
 
     Args:
-        tracks (list[TTSTrack]): Tracked objects with score history.
-        dets (list[TTSTrack]): Detection objects with scores.
+        tracks (list[TTSTrack]): Tracks with `score` and `prev_score` attributes.
+        dets (list[TTSTrack]): Detection candidates.
 
     Returns:
         (np.ndarray): Confidence distance matrix of shape (N, M).
@@ -175,10 +174,8 @@ def _confidence_distance(tracks: list, dets: list) -> np.ndarray:
     if len(tracks) == 0 or len(dets) == 0:
         return np.ones((len(tracks), len(dets)), dtype=np.float64)
 
-    # Get previous scores (one frame back)
     t_score_prev = np.array([t.prev_score for t in tracks])
     t_score = np.array([t.score for t in tracks])
-    # Linear projection
     t_score_proj = t_score + (t_score - t_score_prev)
 
     d_score = np.array([d.score for d in dets])
@@ -186,23 +183,27 @@ def _confidence_distance(tracks: list, dets: list) -> np.ndarray:
 
 
 def _iterative_associate(cost: np.ndarray, match_thr: float, reduce_step: float = 0.05):
-    """Iteratively associate tracks and detections with decreasing threshold.
+    """Greedily match tracks to detections with a progressively relaxed threshold.
+
+    At each iteration the minimum-cost mutually-nearest pairs below `match_thr` are added to the
+    matches, those rows/columns are masked out, and `match_thr` is reduced by `reduce_step`. This
+    prioritizes high-confidence matches while still allowing weaker associations to be made in
+    later iterations.
 
     Args:
-        cost (np.ndarray): Cost matrix of shape (N, M).
+        cost (np.ndarray): Cost matrix of shape (N, M) with values in [0, 1].
         match_thr (float): Initial matching threshold.
-        reduce_step (float): Amount to reduce threshold each iteration.
+        reduce_step (float): Amount to reduce the threshold after each iteration.
 
     Returns:
-        matches (list[list[int]]): Matched (track_idx, det_idx) pairs.
-        u_tracks (list[int]): Unmatched track indices.
-        u_dets (list[int]): Unmatched detection indices.
+        matches (list[list[int]]): List of matched (track_idx, det_idx) pairs.
+        u_tracks (list[int]): Indices of unmatched tracks.
+        u_dets (list[int]): Indices of unmatched detections.
     """
     matches = []
     cost = cost.copy()
 
     while True:
-        # Find greedy minimum-cost matches
         new_matches = []
         if cost.shape[0] > 0 and cost.shape[1] > 0:
             min_det_per_track = np.argmin(cost, axis=1)
@@ -218,28 +219,30 @@ def _iterative_associate(cost: np.ndarray, match_thr: float, reduce_step: float 
         for t, d in new_matches:
             cost[t, :] = 1.0
             cost[:, d] = 1.0
-
         match_thr -= reduce_step
 
     m_tracks = {t for t, _ in matches}
     m_dets = {d for _, d in matches}
     u_tracks = [t for t in range(cost.shape[0]) if t not in m_tracks]
     u_dets = [d for d in range(cost.shape[1]) if d not in m_dets]
-
     return matches, u_tracks, u_dets
 
 
 def _track_aware_nms(tracks: list, dets: list, tai_thr: float, init_thr: float) -> list[bool]:
-    """Track-Aware Initialization NMS to suppress detections that overlap with existing tracks.
+    """Apply Track-Aware Initialization NMS to filter candidates for new-track creation.
+
+    A detection is allowed to spawn a new track only if its score is above `init_thr`, it does not
+    overlap an existing active track by more than `tai_thr`, and it is not overlapped by any
+    higher-scoring detection that is also about to start a track.
 
     Args:
-        tracks (list): Existing active tracks.
-        dets (list): New detection candidates.
-        tai_thr (float): IoU threshold for suppression against tracks and other detections.
-        init_thr (float): Minimum score for new track initialization.
+        tracks (list): Currently active tracks.
+        dets (list): Detection candidates for new track initialization.
+        tai_thr (float): IoU threshold used to suppress overlapping candidates.
+        init_thr (float): Minimum detection score required to consider spawning a new track.
 
     Returns:
-        (list[bool]): Flags indicating which detections are allowed for initialization.
+        (list[bool]): One flag per detection indicating whether it may initialize a new track.
     """
     if len(dets) == 0:
         return []
@@ -247,7 +250,6 @@ def _track_aware_nms(tracks: list, dets: list, tai_thr: float, init_thr: float) 
     scores = np.array([d.score for d in dets])
     allow = list(scores > init_thr)
 
-    # Compute pairwise IoU among all tracks + dets
     all_objs = tracks + dets
     if len(all_objs) < 2:
         return allow
@@ -259,11 +261,11 @@ def _track_aware_nms(tracks: list, dets: list, tai_thr: float, init_thr: float) 
     for i in range(len(dets)):
         if not allow[i]:
             continue
-        # Check overlap with existing tracks
+        # Suppress if heavily overlapping an existing track
         if n_tracks > 0 and np.max(pair_iou[n_tracks + i, :n_tracks]) > tai_thr:
             allow[i] = False
             continue
-        # Check overlap with higher-scoring detections
+        # Suppress lower-scoring neighbors that heavily overlap this detection
         for j in range(len(dets)):
             if i != j and allow[j] and scores[i] > scores[j]:
                 if pair_iou[n_tracks + i, n_tracks + j] > tai_thr:
@@ -273,26 +275,60 @@ def _track_aware_nms(tracks: list, dets: list, tai_thr: float, init_thr: float) 
 
 
 class TTSTrack(BaseTrack):
-    """Single object track for TrackTrack with corner velocity and ReID features.
+    """Single-object track for TrackTrack with corner velocity, score history, and ReID features.
+
+    Extends BaseTrack with state needed for TrackTrack's multi-cue association: per-corner unit
+    velocity vectors used by the angle distance, previous-frame score for confidence projection,
+    a per-frame box history used for velocity lookback, and optional EMA-smoothed ReID features.
 
     Attributes:
-        shared_kalman (KalmanFilterXYWH): Shared Kalman filter for all TTSTrack instances.
-        velocity (np.ndarray): Corner velocity vectors of shape (4, 2).
-        feat (np.ndarray | None): ReID feature vector (EMA smoothed).
-        curr_feat (np.ndarray | None): Current frame's raw feature.
-        _history (dict): Frame-indexed history storing (box, score, mean, covariance).
+        shared_kalman (KalmanFilterXYWH): Shared Kalman filter instance used for batch prediction.
+        _tlwh (np.ndarray): Initial box in top-left-width-height format.
+        kalman_filter (KalmanFilterXYWH): Per-track Kalman filter used after activation.
+        mean (np.ndarray): Mean state vector of the Kalman filter.
+        covariance (np.ndarray): Covariance matrix of the Kalman filter.
+        is_activated (bool): Whether the track has been promoted from new to active.
+        score (float): Current detection confidence.
+        prev_score (float): Confidence on the previous update (for score projection).
+        tracklet_len (int): Number of successful updates since activation.
+        cls (Any): Class label.
+        idx (int): Index of the originating detection within the current frame.
+        frame_id (int): Frame ID of the most recent update.
+        start_frame (int): Frame in which this track was first created.
+        angle (float | None): Rotation angle for oriented boxes, else None.
+        velocity (np.ndarray): Per-corner unit velocity vectors of shape (4, 2).
+        delta_t (int): Look-back window used when constructing corner velocities.
+        smooth_feat (np.ndarray | None): EMA-smoothed ReID embedding.
+        curr_feat (np.ndarray | None): Raw ReID embedding from the current frame.
+
+    Methods:
+        update_features: Update `smooth_feat` and `curr_feat` with EMA smoothing.
+        get_history_box: Retrieve a historical box, falling back to the most recent available frame.
+        predict: Run single-track Kalman prediction.
+        multi_predict: Run batched Kalman prediction for a list of tracks.
+        multi_gmc: Apply a global motion warp to all track states.
+        activate: Initialize a brand new track.
+        re_activate: Reactivate a lost track with a fresh detection.
+        update: Update a matched track with a new detection.
+
+    Examples:
+        Create and activate a new track
+        >>> track = TTSTrack(xywh=[100, 200, 50, 80, 0], score=0.9, cls="person")
+        >>> track.activate(kalman_filter=KalmanFilterXYWH(), frame_id=1)
     """
 
     shared_kalman = KalmanFilterXYWH()
 
     def __init__(self, xywh: list[float], score: float, cls: Any, feat: np.ndarray | None = None):
-        """Initialize a TTSTrack instance.
+        """Initialize a new TTSTrack instance.
 
         Args:
-            xywh (list[float]): Bounding box in (x, y, w, h, idx) or (x, y, w, h, angle, idx) format.
-            score (float): Confidence score.
-            cls (Any): Class label.
-            feat (np.ndarray | None): Optional ReID feature vector.
+            xywh (list[float]): Bounding box in `(x, y, w, h, idx)` or `(x, y, w, h, angle, idx)`
+                format, where (x, y) is the center, (w, h) are width and height, and `idx` is the
+                detection index in the current frame.
+            score (float): Detection confidence score.
+            cls (Any): Class label for the detected object.
+            feat (np.ndarray | None): Optional ReID feature vector attached to this detection.
         """
         super().__init__()
         assert len(xywh) in {5, 6}, f"expected 5 or 6 values but got {len(xywh)}"
@@ -308,14 +344,14 @@ class TTSTrack(BaseTrack):
         self.idx = xywh[-1]
         self.angle = xywh[4] if len(xywh) == 6 else None
 
-        # Corner velocity (4 corners x 2D)
+        # Per-corner unit velocity vectors (LT, LB, RT, RB) and lookback window
         self.velocity = np.zeros((4, 2), dtype=np.float64)
         self.delta_t = 3
 
-        # History: frame_id -> (box_xyxy, score, mean, covariance)
+        # Frame-indexed history: frame_id -> (box_xyxy, score, mean, covariance)
         self._history: dict[int, tuple] = {}
 
-        # ReID features
+        # ReID feature state
         self.smooth_feat = None
         self.curr_feat = None
         self._alpha = 0.95
@@ -323,10 +359,13 @@ class TTSTrack(BaseTrack):
             self.update_features(feat)
 
     def update_features(self, feat: np.ndarray):
-        """Update feature vector with EMA smoothing.
+        """Update the ReID feature cache with exponential moving average smoothing.
+
+        The smoothing factor beta adapts with the current detection score so high-confidence
+        observations have slightly more influence on the long-term feature.
 
         Args:
-            feat (np.ndarray): New feature vector.
+            feat (np.ndarray): New (unnormalized) feature vector.
         """
         feat = feat / (np.linalg.norm(feat) + 1e-9)
         self.curr_feat = feat
@@ -338,14 +377,17 @@ class TTSTrack(BaseTrack):
             self.smooth_feat /= np.linalg.norm(self.smooth_feat) + 1e-9
 
     def get_history_box(self, frame_id: int, dt: int) -> np.ndarray:
-        """Get box from history dt frames back, falling back to most recent.
+        """Return the historical box from `dt` frames before `frame_id`.
+
+        Falls back to the most recent stored box if no exact match exists, and to the current box
+        if the history is empty (new tracks).
 
         Args:
             frame_id (int): Current frame ID.
-            dt (int): Frames to look back.
+            dt (int): Number of frames to look back.
 
         Returns:
-            (np.ndarray): Box in xyxy format.
+            (np.ndarray): Historical box in (x1, y1, x2, y2) format.
         """
         target = frame_id - dt
         if target in self._history:
@@ -355,7 +397,7 @@ class TTSTrack(BaseTrack):
         return self.xyxy.copy()
 
     def predict(self):
-        """Predict the next state using the Kalman filter."""
+        """Predict the next state (mean and covariance) of the track using the Kalman filter."""
         mean_state = self.mean.copy()
         if self.state != TrackState.Tracked:
             mean_state[6] = 0
@@ -363,12 +405,28 @@ class TTSTrack(BaseTrack):
         self.mean, self.covariance = self.kalman_filter.predict(mean_state, self.covariance)
 
     @staticmethod
+    def multi_predict(stracks: list[TTSTrack]):
+        """Run batched Kalman prediction over the provided list of tracks."""
+        if len(stracks) <= 0:
+            return
+        multi_mean = np.asarray([st.mean.copy() for st in stracks])
+        multi_covariance = np.asarray([st.covariance for st in stracks])
+        for i, st in enumerate(stracks):
+            if st.state != TrackState.Tracked:
+                multi_mean[i][6] = 0
+                multi_mean[i][7] = 0
+        multi_mean, multi_covariance = TTSTrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
+        for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
+            stracks[i].mean = mean
+            stracks[i].covariance = cov
+
+    @staticmethod
     def multi_gmc(stracks: list[TTSTrack], H: np.ndarray = np.eye(2, 3)):
-        """Update multiple track positions and covariances using a homography matrix.
+        """Apply a global motion compensation warp to every track's mean and covariance.
 
         Args:
-            stracks (list[TTSTrack]): List of tracks to update.
-            H (np.ndarray): 2x3 affine warp matrix.
+            stracks (list[TTSTrack]): Tracks to warp in place.
+            H (np.ndarray): 2x3 affine transform describing camera motion between frames.
         """
         if stracks:
             multi_mean = np.asarray([st.mean.copy() for st in stracks])
@@ -383,27 +441,11 @@ class TTSTrack(BaseTrack):
                 stracks[i].mean = mean
                 stracks[i].covariance = cov
 
-    @staticmethod
-    def multi_predict(stracks: list[TTSTrack]):
-        """Perform batch Kalman filter prediction for multiple tracks."""
-        if len(stracks) <= 0:
-            return
-        multi_mean = np.asarray([st.mean.copy() for st in stracks])
-        multi_covariance = np.asarray([st.covariance for st in stracks])
-        for i, st in enumerate(stracks):
-            if st.state != TrackState.Tracked:
-                multi_mean[i][6] = 0
-                multi_mean[i][7] = 0
-        multi_mean, multi_covariance = TTSTrack.shared_kalman.multi_predict(multi_mean, multi_covariance)
-        for i, (mean, cov) in enumerate(zip(multi_mean, multi_covariance)):
-            stracks[i].mean = mean
-            stracks[i].covariance = cov
-
     def activate(self, kalman_filter: KalmanFilterXYWH, frame_id: int):
-        """Activate a new tracklet.
+        """Activate a brand new tracklet and initialize its Kalman state and history entry.
 
         Args:
-            kalman_filter (KalmanFilterXYWH): Kalman filter instance.
+            kalman_filter (KalmanFilterXYWH): Kalman filter instance to attach to this track.
             frame_id (int): Current frame ID.
         """
         self.kalman_filter = kalman_filter
@@ -419,12 +461,12 @@ class TTSTrack(BaseTrack):
         self.start_frame = frame_id
 
     def re_activate(self, new_track: TTSTrack, frame_id: int, new_id: bool = False):
-        """Reactivate a previously lost track.
+        """Reactivate a previously lost track by absorbing a newly matched detection.
 
         Args:
-            new_track (TTSTrack): New detection to reactivate with.
+            new_track (TTSTrack): Detection object that matched this lost track.
             frame_id (int): Current frame ID.
-            new_id (bool): Whether to assign a new track ID.
+            new_id (bool): If True, assign a fresh track ID rather than reusing the old one.
         """
         self.prev_score = self.score
         self.mean, self.covariance = self.kalman_filter.update(
@@ -446,10 +488,10 @@ class TTSTrack(BaseTrack):
         self.idx = new_track.idx
 
     def update(self, new_track: TTSTrack, frame_id: int):
-        """Update the track with a new matched detection.
+        """Update a matched track with a fresh detection, refreshing velocity and ReID features.
 
         Args:
-            new_track (TTSTrack): Matched detection.
+            new_track (TTSTrack): Matched detection for this frame.
             frame_id (int): Current frame ID.
         """
         self.frame_id = frame_id
@@ -462,7 +504,7 @@ class TTSTrack(BaseTrack):
         )
         self._history[frame_id] = (new_track.xyxy.copy(), new_track.score, self.mean.copy(), self.covariance.copy())
 
-        # Update corner velocity
+        # Recompute corner velocity as an average of 1..delta_t-frame lookbacks
         self.velocity = np.zeros((4, 2), dtype=np.float64)
         for dt in range(1, self.delta_t + 1):
             prev_box = self.get_history_box(frame_id, dt)
@@ -480,12 +522,12 @@ class TTSTrack(BaseTrack):
         self.idx = new_track.idx
 
     def convert_coords(self, tlwh: np.ndarray) -> np.ndarray:
-        """Convert tlwh to xywh format for the Kalman filter."""
+        """Convert a top-left-width-height box to the center-x-center-y-width-height format used by the filter."""
         return self.tlwh_to_xywh(tlwh)
 
     @property
     def tlwh(self) -> np.ndarray:
-        """Get bounding box in top-left-width-height format."""
+        """Get the current bounding box in (top-left x, top-left y, width, height) format."""
         if self.mean is None:
             return self._tlwh.copy()
         ret = self.mean[:4].copy()
@@ -494,28 +536,28 @@ class TTSTrack(BaseTrack):
 
     @property
     def xyxy(self) -> np.ndarray:
-        """Convert bounding box from tlwh to xyxy format."""
+        """Get the current bounding box in (min x, min y, max x, max y) format."""
         ret = self.tlwh.copy()
         ret[2:] += ret[:2]
         return ret
 
     @staticmethod
     def tlwh_to_xywh(tlwh: np.ndarray) -> np.ndarray:
-        """Convert bounding box from tlwh to xywh (center-x, center-y, width, height) format."""
+        """Convert a tlwh box to (center x, center y, width, height) format."""
         ret = np.asarray(tlwh).copy()
         ret[:2] += ret[2:] / 2
         return ret
 
     @property
     def xywh(self) -> np.ndarray:
-        """Get bounding box in (center x, center y, width, height) format."""
+        """Get the current bounding box in (center x, center y, width, height) format."""
         ret = np.asarray(self.tlwh).copy()
         ret[:2] += ret[2:] / 2
         return ret
 
     @property
     def xywha(self) -> np.ndarray:
-        """Get position in (center x, center y, width, height, angle) format."""
+        """Get position in (center x, center y, width, height, angle) format; falls back to xywh if angle is missing."""
         if self.angle is None:
             from ..utils import LOGGER
 
@@ -525,34 +567,72 @@ class TTSTrack(BaseTrack):
 
     @property
     def result(self) -> list[float]:
-        """Get the current tracking results."""
+        """Get the packed tracking result `[*coords, track_id, score, cls, idx]` for downstream use."""
         coords = self.xyxy if self.angle is None else self.xywha
         return [*coords.tolist(), self.track_id, self.score, self.cls, self.idx]
 
     def __repr__(self) -> str:
-        """Return a string representation."""
+        """Return a short string representation showing the track ID and its active frame range."""
         return f"TT_{self.track_id}_({self.start_frame}-{self.end_frame})"
 
 
 class TRACKTRACK:
-    """TrackTrack: Multi-cue tracker with iterative assignment and track-aware initialization.
+    """TrackTrack: multi-object tracker based on Track-Perspective Association and Track-Aware Init.
 
-    Implements the algorithm from "Focusing on Tracks for Online Multi-Object Tracking" (CVPR 2025).
+    This class implements the full algorithm from Shim et al. (CVPR 2025). Detections are split
+    into high-confidence, low-confidence, and deleted (loose-NMS recovered) sets. A multi-cue cost
+    matrix is built from HMIoU, cosine ReID similarity, confidence projection, and corner angle
+    distance, then solved with iterative assignment. Unmatched high-confidence detections are
+    passed through Track-Aware Initialization NMS before creating new tracks.
 
     Attributes:
-        tracked_stracks (list[TTSTrack]): Successfully activated tracks.
-        lost_stracks (list[TTSTrack]): Lost tracks.
-        removed_stracks (list[TTSTrack]): Removed tracks.
+        tracked_stracks (list[TTSTrack]): Currently active tracks.
+        lost_stracks (list[TTSTrack]): Tracks that are temporarily lost (still within track_buffer).
+        removed_stracks (list[TTSTrack]): Tracks that have been removed.
         frame_id (int): Current frame ID.
-        args (Namespace): Tracker configuration.
+        args (Namespace): Parsed tracker configuration.
+        max_time_lost (int): Maximum number of frames a lost track is kept before removal.
+        kalman_filter (KalmanFilterXYWH): Kalman filter used when activating new tracks.
+        det_thr (float): Score threshold that separates D_high from D_low.
+        match_thr (float): Starting threshold for iterative assignment.
+        penalty_p (float): Cost penalty added to D_low columns (paper τ_p).
+        penalty_q (float): Cost penalty added to D_del columns (paper τ_q).
+        reduce_step (float): Amount to reduce match_thr between iterative-assignment rounds.
+        iou_weight (float): Weight for the HMIoU distance term in the cost matrix.
+        reid_weight (float): Weight for the cosine ReID distance term (or HMIoU fallback).
+        conf_weight (float): Weight for the confidence projection distance.
+        angle_weight (float): Weight for the corner angle distance.
+        tai_thr (float): IoU threshold used inside Track-Aware Initialization NMS.
+        init_thr (float): Minimum score for a detection to be allowed to start a new track.
+        gmc (GMC): Global motion compensation module used to warp tracks between frames.
+        with_reid (bool): Whether ReID features are used to refine the cost matrix.
+        encoder (Callable | None): ReID feature extractor when `with_reid` is True.
+
+    Methods:
+        update: Advance the tracker one frame and return the active tracked objects.
+        get_kalmanfilter: Return a Kalman filter instance used for new tracks.
+        init_track: Build TTSTrack detection objects from raw results.
+        multi_predict: Run batched Kalman prediction across a list of tracks.
+        reset_id: Reset the global track ID counter.
+        reset: Clear all tracker state.
+        joint_stracks: Merge two track lists while keeping track IDs unique.
+        sub_stracks: Remove tracks present in one list from another.
+        remove_duplicate_stracks: Resolve overlapping tracks by keeping the older one.
+
+    Examples:
+        Initialize TrackTrack and process a frame of detections
+        >>> tracker = TRACKTRACK(args, frame_rate=30)
+        >>> results = yolo_model.detect(image)
+        >>> tracked_objects = tracker.update(results, img=image)
     """
 
     def __init__(self, args, frame_rate: int = 30):
         """Initialize a TRACKTRACK instance.
 
         Args:
-            args (Namespace): Tracker configuration arguments.
-            frame_rate (int): Frame rate of the video.
+            args (Namespace): Parsed tracker configuration containing thresholds, cost weights,
+                GMC parameters, and ReID options. See `ultralytics/cfg/trackers/tracktrack.yaml`.
+            frame_rate (int): Frame rate of the input video, used to scale the lost-track buffer.
         """
         self.tracked_stracks: list[TTSTrack] = []
         self.lost_stracks: list[TTSTrack] = []
@@ -564,7 +644,7 @@ class TRACKTRACK:
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
 
-        # Association parameters
+        # Cost matrix weights and iterative assignment parameters
         self.det_thr = getattr(args, "det_thr", 0.6)
         self.match_thr = getattr(args, "match_thresh", 0.7)
         self.penalty_p = getattr(args, "penalty_p", 0.2)
@@ -576,15 +656,14 @@ class TRACKTRACK:
         self.conf_weight = getattr(args, "conf_weight", 0.1)
         self.angle_weight = getattr(args, "angle_weight", 0.05)
 
-        # Initialization parameters
+        # Track-Aware Initialization parameters
         self.tai_thr = getattr(args, "tai_thr", 0.55)
         self.init_thr = getattr(args, "init_thr", 0.7)
 
-        # GMC (camera motion compensation)
+        # Global motion compensation; maxCorners/downscale/skip are tunable for speed
         gmc_method = getattr(args, "gmc_method", "sparseOptFlow")
         gmc_downscale = getattr(args, "gmc_downscale", 3)
         self.gmc = GMC(method=gmc_method, downscale=gmc_downscale)
-        # Tune sparseOptFlow for speed: fewer corners suffice for affine motion estimation
         if gmc_method == "sparseOptFlow":
             gmc_max_corners = getattr(args, "gmc_max_corners", 200)
             self.gmc.feature_params["maxCorners"] = gmc_max_corners
@@ -592,7 +671,7 @@ class TRACKTRACK:
         self._gmc_warp_cached = np.eye(2, 3, dtype=np.float64)
         self._gmc_counter = 0
 
-        # ReID
+        # ReID encoder: "auto" uses the detector's backbone features; a path loads an external model
         self.with_reid = getattr(args, "with_reid", False)
         self.encoder = None
         if self.with_reid:
@@ -604,17 +683,23 @@ class TRACKTRACK:
 
                 self.encoder = ReID(model)
 
-    def update(self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None, dets_del=None) -> np.ndarray:
-        """Update tracker with new detections.
+    def update(
+        self, results, img: np.ndarray | None = None, feats: np.ndarray | None = None, dets_del=None
+    ) -> np.ndarray:
+        """Advance the tracker by one frame and return the active tracked objects.
 
         Args:
-            results: Detection results with conf, xywh/xywhr, and cls attributes.
-            img (np.ndarray | None): Current frame image (for ReID).
-            feats (np.ndarray | None): Pre-extracted features from backbone.
-            dets_del (tuple | None): Deleted detections (xywh, conf, cls) from loose NMS.
+            results (object): Detection results exposing `conf`, `cls`, and either `xywh` or
+                `xywhr` (oriented boxes). Indexable by class labels returned from YOLO.
+            img (np.ndarray | None): Current frame as a (H, W, 3) BGR image, required for GMC and
+                ReID feature extraction.
+            feats (np.ndarray | None): Optional backbone features when the ReID encoder is in
+                "auto" mode.
+            dets_del (tuple | None): Optional deleted-detection bundle `(xywh, conf, cls)` produced
+                by a looser secondary NMS pass (paper's D_del).
 
         Returns:
-            (np.ndarray): Array of tracked objects [x1, y1, x2, y2, id, score, cls, idx].
+            (np.ndarray): Array of shape (N, 8) with rows `[x1, y1, x2, y2, id, score, cls, idx]`.
         """
         self.frame_id += 1
         activated_stracks = []
@@ -626,7 +711,7 @@ class TRACKTRACK:
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
         bboxes = np.concatenate([bboxes, np.arange(len(bboxes)).reshape(-1, 1)], axis=-1)
 
-        # Split detections into high/low confidence
+        # Partition detections into high and low confidence subsets
         remain_inds = scores >= self.args.track_high_thresh
         inds_low = (scores > self.args.track_low_thresh) & (scores < self.args.track_high_thresh)
 
@@ -638,27 +723,27 @@ class TRACKTRACK:
         scores_second = scores[inds_low]
         cls_second = results.cls[inds_low]
 
-        # Initialize detection objects
+        # Build detection objects; attach ReID features to high-confidence detections when enabled
         if self.with_reid and self.encoder is not None and img is not None:
-            features = self.encoder(img, bboxes_keep)  # ReID encoder crops from full image
+            features = self.encoder(img, bboxes_keep)  # external ReID encoder crops from the full image
             dets_high = [TTSTrack(b, s, c, f) for b, s, c, f in zip(bboxes_keep, scores_keep, cls_keep, features)]
         else:
             dets_high = [TTSTrack(b, s, c) for b, s, c in zip(bboxes_keep, scores_keep, cls_keep)]
         dets_low = [TTSTrack(b, s, c) for b, s, c in zip(bboxes_second, scores_second, cls_second)]
 
-        # D_del: deleted high-confidence detections recovered from loose NMS (paper Eq. 1)
+        # D_del: high-confidence detections recovered from a looser NMS pass (paper Eq. 1)
         dets_del_high = []
         if dets_del is not None:
             del_xywh, del_conf, del_cls = dets_del
-            # Add dummy index column to match bboxes format
             del_bboxes = np.concatenate([del_xywh, -np.ones((len(del_xywh), 1))], axis=-1)
-            # Only keep high-confidence deleted detections
             del_high_mask = del_conf > self.det_thr
             if del_high_mask.any():
-                dets_del_high = [TTSTrack(b, s, c) for b, s, c in
-                                 zip(del_bboxes[del_high_mask], del_conf[del_high_mask], del_cls[del_high_mask])]
+                dets_del_high = [
+                    TTSTrack(b, s, c)
+                    for b, s, c in zip(del_bboxes[del_high_mask], del_conf[del_high_mask], del_cls[del_high_mask])
+                ]
 
-        # Split existing tracks
+        # Separate activated (tracked/lost) tracks from new unconfirmed ones
         tracked_stracks = []
         unconfirmed = []
         for track in self.tracked_stracks:
@@ -666,11 +751,9 @@ class TRACKTRACK:
                 unconfirmed.append(track)
             else:
                 tracked_stracks.append(track)
-
-        # Pool tracked + lost tracks
         strack_pool = self.joint_stracks(tracked_stracks, self.lost_stracks)
 
-        # Camera motion compensation (optionally skip frames for speed)
+        # Apply global motion compensation; optionally reuse the previous warp for several frames
         if img is not None:
             if self._gmc_skip > 0 and self._gmc_counter % (self._gmc_skip + 1) != 0:
                 warp = self._gmc_warp_cached
@@ -681,41 +764,34 @@ class TRACKTRACK:
             TTSTrack.multi_gmc(strack_pool, warp)
             TTSTrack.multi_gmc(unconfirmed, warp)
 
-        # Predict
+        # Kalman prediction before association
         self.multi_predict(strack_pool)
 
-        # === Main association: tracked+lost vs high+low+del detections (paper Eq. 1) ===
+        # Main association: tracked/lost vs the combined D_high + D_low + D_del (paper Eq. 1)
         all_dets = dets_high + dets_low + dets_del_high
         n_high = len(dets_high)
         n_low = len(dets_low)
 
-        # Compute multi-cue cost matrix
         iou_sim, hmiou_dist = _hmiou_distance(strack_pool, all_dets)
         cost = self.iou_weight * hmiou_dist
-
-        # Add cosine distance if ReID is enabled
         if self.with_reid and self.encoder is not None:
-            cos_dist = self._cosine_distance(strack_pool, all_dets)
-            cost += self.reid_weight * cos_dist
+            cost += self.reid_weight * self._cosine_distance(strack_pool, all_dets)
         else:
-            cost += self.reid_weight * hmiou_dist  # Fall back to HMIoU for the ReID weight
-
-        # Add confidence and angle distances
+            cost += self.reid_weight * hmiou_dist  # fall back to HMIoU when no ReID is available
         cost += self.conf_weight * _confidence_distance(strack_pool, all_dets)
         cost += self.angle_weight * _angle_distance(strack_pool, all_dets, self.frame_id)
 
-        # Penalize low-confidence and deleted detections (paper Eq. 1)
+        # Column-wise penalties for low-confidence and deleted detections
         if cost.shape[1] > n_high:
-            cost[:, n_high:n_high + n_low] += self.penalty_p  # τ_p for D_low
+            cost[:, n_high : n_high + n_low] += self.penalty_p  # τ_p for D_low
         if dets_del_high and cost.shape[1] > n_high + n_low:
-            cost[:, n_high + n_low:] += self.penalty_q  # τ_q for D_del
+            cost[:, n_high + n_low :] += self.penalty_q  # τ_q for D_del
 
-        # Constrain: if IoU is too low, set cost to 1
+        # Force dissociation where the raw IoU is negligible
         if iou_sim.size > 0:
             cost[iou_sim <= 0.10] = 1.0
         cost = np.clip(cost, 0, 1)
 
-        # Iterative assignment
         matches, u_track, u_det = _iterative_associate(cost, self.match_thr, self.reduce_step)
 
         for t_idx, d_idx in matches:
@@ -728,14 +804,14 @@ class TRACKTRACK:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
 
-        # Mark unmatched tracks as lost
         for t_idx in u_track:
             track = strack_pool[t_idx]
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
 
-        # === Association: unconfirmed tracks vs remaining high-confidence detections ===
+        # Second association: unconfirmed tracks vs leftover high-confidence detections, using the
+        # same multi-cue cost as the main stage so ReID information is not discarded.
         remaining_high_dets = [all_dets[i] for i in u_det if i < n_high]
         if unconfirmed and remaining_high_dets:
             uc_iou_sim, uc_hmiou_dist = _hmiou_distance(unconfirmed, remaining_high_dets)
@@ -762,7 +838,7 @@ class TRACKTRACK:
                 track.mark_removed()
                 removed_stracks.append(track)
 
-        # === Track-Aware Initialization ===
+        # Track-Aware Initialization: spawn new tracks only from survivors of TAI NMS
         active_tracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         active_tracks.extend(activated_stracks)
         allow_flags = _track_aware_nms(active_tracks, remaining_high_dets, self.tai_thr, self.init_thr)
@@ -771,21 +847,20 @@ class TRACKTRACK:
                 det.activate(self.kalman_filter, self.frame_id)
                 activated_stracks.append(det)
 
-        # === Cleanup ===
+        # Remove lost tracks that have exceeded the buffer
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:
                 track.mark_removed()
                 removed_stracks.append(track)
 
+        # Bookkeeping: merge/filter track lists and bound the removed-tracks history
         self.tracked_stracks = [t for t in self.tracked_stracks if t.state == TrackState.Tracked]
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, activated_stracks)
         self.tracked_stracks = self.joint_stracks(self.tracked_stracks, refind_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
-        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(
-            self.tracked_stracks, self.lost_stracks
-        )
+        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-1000:]
@@ -797,36 +872,42 @@ class TRACKTRACK:
 
     @staticmethod
     def _cosine_distance(tracks: list[TTSTrack], dets: list[TTSTrack]) -> np.ndarray:
-        """Compute cosine distance between track and detection features.
+        """Compute pairwise cosine distance between track and detection ReID embeddings.
+
+        Missing embeddings are substituted with zero vectors of the detected feature dimension so
+        rows/columns without features contribute a constant maximum distance.
 
         Args:
-            tracks (list[TTSTrack]): Tracks with smooth_feat.
-            dets (list[TTSTrack]): Detections with curr_feat.
+            tracks (list[TTSTrack]): Tracks carrying an EMA-smoothed `smooth_feat`.
+            dets (list[TTSTrack]): Detections carrying `curr_feat`.
 
         Returns:
-            (np.ndarray): Cosine distance matrix of shape (N, M).
+            (np.ndarray): Cosine distance matrix of shape (N, M) clipped to [0, 1].
         """
         if len(tracks) == 0 or len(dets) == 0:
             return np.ones((len(tracks), len(dets)), dtype=np.float64)
 
-        # Determine feature dimension from first available feature
-        dim = 128
+        dim = 128  # fallback feature dim if no embeddings have been populated yet
         for obj in (*tracks, *dets):
             f = obj.smooth_feat if obj.smooth_feat is not None else obj.curr_feat
             if f is not None:
                 dim = f.shape[0]
                 break
 
-        t_feat = np.stack([t.smooth_feat if t.smooth_feat is not None else np.zeros(dim, dtype=np.float32) for t in tracks])
-        d_feat = np.stack([d.curr_feat if d.curr_feat is not None else np.zeros(dim, dtype=np.float32) for d in dets])
+        t_feat = np.stack(
+            [t.smooth_feat if t.smooth_feat is not None else np.zeros(dim, dtype=np.float32) for t in tracks]
+        )
+        d_feat = np.stack(
+            [d.curr_feat if d.curr_feat is not None else np.zeros(dim, dtype=np.float32) for d in dets]
+        )
         return np.clip(1 - np.dot(t_feat, d_feat.T), 0, 1)
 
     def get_kalmanfilter(self) -> KalmanFilterXYWH:
-        """Return a KalmanFilterXYWH instance."""
+        """Return the Kalman filter instance used when activating new tracks."""
         return KalmanFilterXYWH()
 
     def init_track(self, results, img: np.ndarray | None = None) -> list[TTSTrack]:
-        """Initialize tracks from detection results."""
+        """Build TTSTrack detection objects from raw YOLO results."""
         if len(results) == 0:
             return []
         bboxes = results.xywhr if hasattr(results, "xywhr") else results.xywh
@@ -834,16 +915,16 @@ class TRACKTRACK:
         return [TTSTrack(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
 
     def multi_predict(self, tracks: list[TTSTrack]):
-        """Predict the next states for multiple tracks."""
+        """Run batched Kalman prediction for the provided list of tracks."""
         TTSTrack.multi_predict(tracks)
 
     @staticmethod
     def reset_id():
-        """Reset the ID counter."""
+        """Reset the global TTSTrack ID counter."""
         TTSTrack.reset_id()
 
     def reset(self):
-        """Reset the tracker state."""
+        """Reset all tracker state, including GMC warp history and the ID counter."""
         self.tracked_stracks: list[TTSTrack] = []
         self.lost_stracks: list[TTSTrack] = []
         self.removed_stracks: list[TTSTrack] = []
@@ -854,7 +935,7 @@ class TRACKTRACK:
 
     @staticmethod
     def joint_stracks(tlista: list[TTSTrack], tlistb: list[TTSTrack]) -> list[TTSTrack]:
-        """Combine two lists of tracks, ensuring no duplicates by track_id."""
+        """Concatenate two track lists while ensuring track IDs remain unique."""
         exists = {}
         res = []
         for t in tlista:
@@ -868,7 +949,7 @@ class TRACKTRACK:
 
     @staticmethod
     def sub_stracks(tlista: list[TTSTrack], tlistb: list[TTSTrack]) -> list[TTSTrack]:
-        """Remove tracks in tlistb from tlista."""
+        """Return tlista with every track present in tlistb removed."""
         track_ids_b = {t.track_id for t in tlistb}
         return [t for t in tlista if t.track_id not in track_ids_b]
 
@@ -876,7 +957,7 @@ class TRACKTRACK:
     def remove_duplicate_stracks(
         stracksa: list[TTSTrack], stracksb: list[TTSTrack]
     ) -> tuple[list[TTSTrack], list[TTSTrack]]:
-        """Remove duplicate tracks based on IoU distance."""
+        """Remove duplicates by keeping the longer-lived track for each overlapping pair."""
         pdist = matching.iou_distance(stracksa, stracksb)
         pairs = np.where(pdist < 0.15)
         dupa, dupb = [], []
