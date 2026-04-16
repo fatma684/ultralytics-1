@@ -38,7 +38,6 @@ class DistillationModel(nn.Module):
         loss_sl2: Compute score-weighted L2 distillation loss for a feature pair.
         train: Set training mode while keeping teacher frozen.
         fuse: Fuse model layers for inference speedup.
-        load_from_module: Load distillation weights from a checkpoint.
 
     Examples:
         Initialize a distillation model
@@ -267,15 +266,6 @@ class DistillationModel(nn.Module):
         """Fuse model layers for inference speedup."""
         self.student_model.fuse(verbose)
         return self
-
-    def load_from_module(self, weights: dict | nn.Module, strict: bool = False):
-        """Load distillation weights from a checkpoint dict or module."""
-        module = weights["model"] if isinstance(weights, dict) else weights
-        if not isinstance(module, nn.Module):
-            raise TypeError(f"Expected nn.Module or checkpoint dict, got {type(weights).__name__}")
-        incompatible = self.load_state_dict(module.float().state_dict(), strict=strict)
-        self._freeze_teacher()
-        return incompatible
 
     def decouple_outputs(self, preds, shape_check: bool = False, branch: str = "one2one"):
         """Decouple outputs for teacher/student models.

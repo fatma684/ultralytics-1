@@ -311,6 +311,8 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
+        if isinstance(unwrap_model(self.model), DistillationModel):
+            freeze_layer_names.append("teacher_model.")
         self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
@@ -742,10 +744,9 @@ class BaseTrainer:
         if isinstance(weights, DistillationModel):
             if RANK == -1:
                 LOGGER.info("Resuming training DistillationModel from checkpoint weights")
-            student_model = self.get_model(cfg=cfg, weights=None, verbose=RANK in {-1, 0})
+            student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
             student_model.args = self.args
             model = DistillationModel(student_model=student_model, teacher_model=weights.teacher_model)
-            model.load_from_module(weights, strict=True)
             model.criterion = None
             self.model = model
         else:
